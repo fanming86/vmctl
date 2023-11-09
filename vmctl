@@ -1,0 +1,280 @@
+#!/bin/bash
+PATH=/usr/bin:/bin:/usr/sbin:/sbin
+##############################
+function is_running() {
+    # Note this can now be called without root privileges
+    virsh -c 'qemu:///system' list | grep -q "$1"
+}
+
+function is_defined() {
+    # Note this can now be called without root privileges
+    virsh -c 'qemu:///system' list --all | grep -q "$1"
+}
+
+function print_PASS() {
+    echo -e "\\033[1;32mPASS\\033[0;39m"
+}
+
+function print_FAIL() {
+    echo -e "\\033[1;31mFAIL\\033[0;39m"
+}
+
+function print_SUCCESS() {
+    echo -e "\\033[1;36mSUCCESS\\033[0;39m"
+}
+
+function confirm_yn {
+    declare -l user_resp
+    local mesg=${1:-'Are you sure?'}
+    if [[ -z "${QUIET}" ]]; then
+        while :; do
+            echo -n "${mesg} (y/n) "
+            read resp
+            case "${resp}" in
+            y)
+                return 0
+                ;;
+            n)
+                return 1
+                ;;
+            *)
+                echo "Invalid response, type 'y' or 'n' to continue."
+                ;;
+            esac
+        done
+    fi
+    return 0
+}
+
+###############################
+
+function rht_status_vm {
+    local vmlist="$*"
+    for vmname in ${vmlist}; do
+        lockfile=/tmp/.lock-rht-vmctl-${vmname}
+        if is_running ${vmname}; then
+            echo -e "${vmname} \\033[1;32mRUNNING\\033[0;39m"
+        elif is_defined ${vmname}; then
+            echo -e "${vmname} \\033[1;33mDEFINED\\033[0;39m"
+        elif [[ -f ${lockfile} ]]; then
+            echo -e "${vmname} \\033[1;35mPULLING\\033[0;39m"
+        else
+            echo -e "${vmname} \\033[1;31mMISSING\\033[0;39m"
+        fi
+    done
+}
+
+# stop vm
+function rht_stop_vm {
+    local vmlist="$*"
+    for vmname in ${vmlist}; do
+        echo -n "Stopping ${vmname}."
+        # Cap how long we are going to wait
+        i=${RHT_STOPTIMEVMS:-20}
+        while is_running ${vmname} && [[ ${i} -gt 0 ]]; do
+            virsh shutdown ${vmname} &>/dev/null
+            sleep 5
+            let i=i-1
+            echo -n '.'
+        done
+        echo
+        if is_running ${vmname}; then
+            QUIET=yes rht_poweroff_vm ${vmname}
+        fi
+        if is_running ${vmname}; then
+            echo "Error: unable to stop ${vmname}."
+            echo 'Try manually shutting it down then try again.'
+            continue
+        fi
+    done
+}
+
+# start vm
+function rht_start_vm {
+    local vmlist="$*"
+    for vmname in ${vmlist}; do
+        if is_running ${vmname}; then
+            echo "Error: ${vmname} not started (is already running)"
+            continue
+        else
+            if is_defined ${vmname}; then
+                virsh -q start ${vmname} >/dev/null
+            fi
+        fi
+        #    rht_get_vm ${vmname}
+        # if not libvirt defined ; then define it
+        if ! is_defined ${vmname}; then
+            [[ ! -f '/root/.ssh/id_rsa' ]] && ssh-keygen -q -N "" -f /root/.ssh/id_rsa
+            source /usr/lib64/createvm
+            vmip=$(grep $vmname /tmp/.hosts)
+            main $vmip
+            echo "Defining ${vmname} from xml file."
+        fi
+
+        # if [[ -z "${NOSTART}" ]]; then
+        #   # Punt if this VM should not be started (unless explicit)
+        #   if [[ -n "${VMMULTI}" && "${RHT_NOSTARTVMS}" == *${vmname}* ]]; then
+        #     echo "Not starting ${vmname}."
+        #   else
+        #     echo "Starting ${vmname}."
+        #     virsh -q start ${vmname} >/dev/null
+        #   fi
+        # fi
+    done
+}
+
+#power off vm
+function rht_poweroff_vm {
+    local vmlist="$*"
+    if confirm_yn "Are you sure you want to poweroff ${vmlist}?"; then
+        for vmname in ${vmlist}; do
+            echo -n "Powering off ${vmname}."
+            # Cap how long we are going to wait
+            i=60
+            while is_running ${vmname} && [[ ${i} -gt 0 ]]; do
+                virsh destroy ${vmname} &>/dev/null
+                #sleep 1
+                let i=i-1
+                echo -n '.'
+            done
+            echo
+            if is_running ${vmname}; then
+                echo "Error: unable to poweroff ${vmname}."
+                echo 'Try manually stopping it then try again.'
+                continue
+            fi
+        done
+    fi
+}
+
+####restart
+function rht_restart_vm {
+    local vmlist="$*"
+    for vmname in ${vmlist}; do
+        if is_running ${vmname}; then
+            echo "Restarting ${vmname}:"
+            QUIET=yes rht_stop_vm ${vmname}
+            if is_running ${vmname}; then
+                echo "Error: unable to restart ${vmname}."
+            else
+                rht_start_vm ${vmname}
+            fi
+        else
+            echo "Not running ${vmname}."
+        fi
+    done
+}
+
+#reset vm
+function rht_reset_vm {
+    local vmlist="$*"
+    if confirm_yn "Are you sure you want to reset ${vmlist}?"; then
+        for vmname in ${vmlist}; do
+            QUIET=yes rht_poweroff_vm ${vmname}
+        done
+        for vmname in ${vmlist}; do
+            echo "Resetting ${vmname}."
+            lockfile=/tmp/.lock-rht-vmctl-${vmname}
+            virsh undefine ${vmname} &>/dev/null
+            sed -i -e "/^${vmname}/d" /root/.ssh/known_hosts 2>/dev/null
+            sed -i -e "/^${vmname}/d" /etc/hosts 2>/dev/null
+            rm -f ${lockfile} &>/dev/null
+            rm -f ${VMBLKPATH}/${vmname}.qcow2
+            rht_start_vm ${vmname}
+        done
+    fi
+}
+
+#remove
+function rht_remove_vm {
+    local vmlist="$*"
+    if confirm_yn "Are you sure you want to remove ${vmlist}?"; then
+        for vmname in ${vmlist}; do
+            QUIET=yes rht_poweroff_vm ${vmname}
+        done
+        for vmname in ${vmlist}; do
+            echo "Undefining ${vmname}."
+            virsh undefine ${vmname} &>/dev/null
+            rm -f ${VMBLKPATH}/${vmname}.qcow2
+            rm -f ${VMXMLPATH}/${vmname}.xml
+            sed -i -e "/^${vmname}/d" /root/.ssh/known_hosts 2>/dev/null
+            lockfile=/tmp/.lock-rht-vmctl-${vmname}
+            rm -f ${lockfile} &>/dev/null
+        done
+    fi
+}
+
+function print_usage {
+    cat <<EOF
+This utility manages the Training supplied VMs on the local hypervisor.
+
+Usage: vmctl VMCMD VMNAME 
+       vmctl -h|--help
+
+  where VMCMD is one of:
+    start      - obtain and start up VMNAME
+    stop       - stop a running VMNAME
+    restart    - if running, stop then start VMNAME
+    poweroff   - if running, force stop VMNAME
+    reset      - poweroff, reobtain from server, start VMNAME
+    status     - display libvirt status of VMNAME
+
+
+  VMNAME of "all" processes all VMs available in the course
+EOF
+}
+
+if [[ -n "$1" ]]; then
+    case $1 in
+    start | stop | restart | poweroff | reset | status | remove)
+        VMCMD=$1
+        VMNAME=$2
+        ;;
+    *)
+        print_usage
+        exit 1
+        ;;
+    esac
+fi
+
+if [[ -z "${VMCMD}" || -z "${VMNAME}" ]]; then
+    echo "Error: missing subcommand or VMNAME."
+    print_usage
+    exit 1
+fi
+
+#######################
+#RHT_VMS="node1 node2 node3 node4"
+#VMBLKPATH=/var/lib/libvirt/images
+#VMXMLPATH=/etc/libvirt/qemu/
+#TPNAME='tp-centos7'
+#ip=192.168.122.1
+source /etc/rht
+
+n=1
+cat /dev/null >/tmp/.hosts
+for i in $RHT_VMS; do
+    echo ${ip}${n} $i >>/tmp/.hosts
+    ((n++))
+done
+
+match=0
+my_vms=${VMNAME}
+if [[ "${VMNAME}" == "all" ]]; then
+    my_vms="${RHT_VMS}"
+    match=1
+elif [[ -n "${VMNAME}" ]]; then
+    match=1
+    my_vms="${VMNAME}"
+fi
+
+if [[ ${match} -eq 0 ]]; then
+    echo "Error: unrecognized VMNAME specified, ${VMNAME}."
+    print_usage
+    exit 1
+fi
+
+if [[ -n "${my_vms}" ]]; then
+    rht_${VMCMD}_vm ${my_vms}
+fi
+

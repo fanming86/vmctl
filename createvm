@@ -1,0 +1,169 @@
+#!/bin/bash
+
+function conf_xml() {
+	#配置xml ，替换内存cpu 等信息并导入
+	vir_uuid=$(uuidgen)
+	vir_mac="52:54:$(dd if=/dev/urandom count=1 2>/dev/null | md5sum | sed -r 's/^(..)(..)(..)(..).*$/\1:\2:\3:\4/')"
+
+	sed -i "s/<name>.*<\/name>/<name>${vmname}<\/name>/" ${destxml}
+	sed -i "s/<uuid>.*<\/uuid>/<uuid>${vir_uuid}<\/uuid>/" ${destxml}
+	sed -i "s/<title>.*<\/title>/<title>${vmname}<\/title>/" ${destxml}
+	sed -i "s/<mac address=.*\/>/<mac address='$vir_mac' \/>/" ${destxml}
+	# 如果是centos7 一类的基础镜像，可以通过同一个镜像创建多个虚拟机，那么这里需要修改镜像文件
+	[[ $c -eq 1 ]] && sed -i "s#<source file='/var/lib/libvirt/images/${OVLNAME}\.qcow2'/>#<source file='${VMBLKPATH}/${vmname}.qcow2'/>#" ${destxml}
+
+}
+
+function define_net() {
+# Check if the network already exists
+if virsh net-list --all | grep -q 'net1'; then
+  return 6
+fi
+
+cat > /tmp/net1 <<EOF
+<network>
+  <name>net1</name>
+  <forward mode='nat'/>
+  <bridge name='virbr1' stp='on' delay='0'/>
+  <ip address='10.0.0.1' netmask='255.255.255.0'>
+    <dhcp>
+      <range start='10.0.0.2' end='10.0.0.254'/>
+    </dhcp>
+  </ip>
+</network>
+EOF
+
+virsh net-define  /tmp/net1  > /dev/null
+virsh net-start  net1  > /dev/null
+virsh net-autostart  net1  > /dev/null
+
+
+}
+
+function download_file() {
+	# 下载xml模板，下载到本地以tp结尾，kvm会直接识别xml文件为一个虚机
+	echo ${DOWNLOADURL}/${TPNAME}/${OVLNAME}.xml
+	[[ ! -f ${VMXMLPATH}/${OVLNAME}.tp ]] && curl -# -f -o ${VMXMLPATH}/${OVLNAME}.tp ${DOWNLOADURL}/${TPNAME}/${OVLNAME}.xml
+	cp ${VMXMLPATH}/${OVLNAME}.tp ${destxml} # 根据模板xml创建新虚拟机要用的xml文件
+
+	##################################
+	# 根据模板xml文件下载镜像文件
+	vdiskList=$(grep -o ${VMBLKPATH}.*qcow2 ${destxml})
+	if [[ $(grep -o ${VMBLKPATH}.*qcow2 ${destxml} | wc -l) -eq 1 ]]; then # xml文件中只需要一个镜像文件时
+		vdisk=${vdiskList#${VMBLKPATH}}
+		if [[ ! -f ${VMBLKPATH}/${vdisk}.ovl ]]; then
+			echo "Downloading image ${vdisk}.ovl  ${DOWNLOADURL}/${TPNAME}/${OVLNAME}.qcow2"
+			if ! curl -# -f -o ${VMBLKPATH}/${vdisk}.ovl ${DOWNLOADURL}/${TPNAME}/${OVLNAME}.qcow2; then
+				echo "Error: Unable to download image - ${VMBLKPATH}/${vdisk}.qcow2"
+				exit 12
+			fi
+		fi
+		chattr -i ${VMBLKPATH}/${vdisk}.ovl
+		qemu-img create -f qcow2 -b ${VMBLKPATH}/${vdisk}.ovl ${VMBLKPATH}/${vmname}.qcow2 >/dev/null
+
+	else # xml文件中有多个镜像时
+		for vdisk0 in ${vdiskList}; do
+			vdisk=${vdisk0#${VMBLKPATH}}
+			# If needed, retrieve qcow2 file
+			if [[ ! -f ${VMBLKPATH}/${vdisk}.ovl ]]; then
+				echo "Downloading multi image ${TPNAME}-${vdisk}.ovl"
+				if ! curl -# -f -o ${VMBLKPATH}/${vdisk}.ovl ${DOWNLOADURL}/${TPNAME}/${TPNAME}-${vdisk}; then
+					echo "Error: Unable to download image - ${VMBLKPATH}/${TPNAME}-${vdisk}"
+					exit 12
+				fi
+			fi
+			# 创建磁盘
+			chattr -i ${VMBLKPATH}/${vdisk}.ovl
+			qemu-img create -f qcow2 -b ${VMBLKPATH}/${vdisk}.ovl ${VMBLKPATH}/${vdisk} >/dev/null
+		done
+
+	fi
+
+}
+
+function start_vir() {
+	#启动并设置开机自启
+	virsh define ${destxml} >/dev/null
+	virt-customize --ssh-inject root:file:/root/.ssh/id_rsa.pub -d ${vmname} >/dev/null
+	[[ $c -eq 1 ]] && virt-edit -d ${vmname} /etc/sysconfig/network-scripts/ifcfg-eth0 -e "s#IPADDR=".*"#IPADDR="${vir_ip}"#" # 替换ip
+	[[ $c -eq 1 ]] && virt-edit -d ${vmname} /etc/hostname -e "s#".*"#"${hostname}"#" # 修改主机名
+
+	virsh start ${vmname} >/dev/null
+	virsh autostart ${vmname} >/dev/null
+	chattr +i ${VMBLKPATH}/${vdisk}.ovl
+}
+
+function write_hosts() {
+	# 生成hosts 文件
+	# openstack --------
+	[[ ${TPNAME} == 'openstack-zed' ]] && [[ ${vmname} == 'controller' ]] && vir_ip=10.0.0.111
+	[[ ${TPNAME} == 'openstack-zed' ]] && [[ ${vmname} == 'compute' ]] && vir_ip=10.0.0.112
+	[[ ${TPNAME} == 'openstack-zed' ]] && [[ ${vmname} == 'block' ]] && vir_ip=10.0.0.113
+	#-------------------
+	cat /etc/hosts | grep ${vmname} &>/dev/null
+	# Check the return value of the command
+	if [ $? -eq 0 ]; then
+		sed -i "s/^.*${vmname}.*$/${vir_ip}    ${vmname}  ${hostname}/g" /etc/hosts
+	else
+		echo "${vir_ip}    ${vmname}  ${hostname}" >>/etc/hosts
+	fi
+}
+
+function check_root {
+	if [[ "$EUID" -gt "0" ]]; then
+		echo 'Error: this script must be run as root!'
+		exit 1
+	fi
+}
+
+main() {
+	check_root
+	source /etc/rht
+
+	DOWNLOADURL='http://172.31.0.242:17242/vm/'
+
+	vir_ip=$1 #虚拟机的IP
+	vmname=$2 #虚拟机的名字
+	# ${VMXMLPATH}		# xml 的位置
+	# ${VMBLKPATH}		# 镜像存储的位置
+	OVLNAME=${TPNAME}-$vmname         #模板镜像和xml的名字
+	destxml=${VMXMLPATH}${vmname}.xml # 新建虚拟机所使用的xml文件
+	hostname=${vmname}.${TPNAME}.training.com
+
+	# 以下环境可以自由创建多个，都是使用同一套镜像和xml，所以需要生成新文件
+	#if [[ ${TPNAME} == rhel8 ]] || [[ ${TPNAME} == centos7 ]] || [[ ${TPNAME} == stream8 ]]; then
+	#		OVLNAME=${TPNAME} #模板的名字
+	#	c=1
+	#fi
+	
+	c=0 # 一个标识,此标识表示该模板可以启动任意个主机
+	d=0
+	case ${TPNAME} in 
+    		rhel8|centos7|stream8|ubuntu2004) 
+		OVLNAME=${TPNAME} 
+        	c=1
+        	;;
+		openstack-zed)
+		define_net
+		;;
+    	*) 
+        	;;
+	esac
+
+#	if [[ ${TPNAME} == 'openstack-zed' ]];then
+#		define_net
+#	fi
+
+	download_file
+	conf_xml
+	start_vir
+	write_hosts
+	# (sshpass -p 'redhat' ssh-copy-id -i /root/.ssh/.id_rsa.pub -o StrictHostKeyChecking=no root@${vmname}) && return 0
+
+}
+
+#main '192.168.122.11' master
+#main '192.168.122.12' node1
+#main '192.168.122.13' node2
+# main '192.168.122.14' vm04
+
